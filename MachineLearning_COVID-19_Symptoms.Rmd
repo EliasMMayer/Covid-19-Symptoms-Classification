@@ -1,0 +1,864 @@
+---
+title: "Machine Learning modeling for COVID-19 prediction - Elias Mayer"
+date: "02 01 2021"
+output: 
+  prettydoc::html_pretty:
+    theme: hpstr 
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    highlight: github
+    math: katex
+bibliography: ML_Assignment_Bibliography.bib
+csl: harvard-university-of-bath.csl
+---
+
+```{r setup, include=FALSE}
+
+
+
+#Style libraries
+library(prettydoc)
+library(RColorBrewer)
+library(kableExtra)
+library(patchwork) 
+
+#working libraries
+library(plyr)
+library(tidyverse)
+
+#Overview libraries
+library(xray) 
+library(skimr) 
+library(summarytools)
+library(ggcorrplot)
+library(rstatix) #Cramer V
+
+#Ml helper libraries
+library(caret) 
+library(rsample)
+library(caretEnsemble)
+library(recipes)
+
+#ML models
+library(ranger) #rf good implement - parallel 
+library(C50)
+library(ipred)
+library(e1071)
+
+#For unbalanced 
+#library(unbalanced)  #for special case balancing 
+library(themis)  #for recipe workflow balancing
+
+#Other 
+library(data.table) #for transpose tibble
+library(MLeval)
+
+
+
+knitr::opts_chunk$set(out.width="900px", dpi=240) #set global width scale for html knitr
+
+#Set up ggplot theme and color scheme for the report
+
+theme_set(theme_minimal())
+
+# Style Preparation for the report 
+
+pal_simple_greens <- brewer.pal(n = 8, name = "YlGn")
+pal_simple_blues <- brewer.pal(n = 8, name = "Blues")
+
+# simple mark colors through the report 
+
+s_blue <- pal_simple_blues[4]
+
+#load data set - just place the file next to the markdown file 
+
+data_Covid19 <- read.csv("data/corona_tested_individuals_ver_006.english.csv") %>%  as_tibble()
+
+
+#get overview
+
+skimr::skim(data_Covid19) # overview
+
+xray::anomalies(data_Covid19) #problem overview
+
+data_Covid19 %>% dfSummary(varnumbers = FALSE, valid.col = FALSE)
+
+```
+
+# INTRODUCTION
+
+This report aims to examine if the results of COVID-19 tests are predictable given a data set of testing results and belonging measurements of symptoms and test indication.
+
+The global SARS-CoV-2 epidemic was first reported in 2019. [@doi:10.1056/NEJMc2001737] Widespread Testing proved itself as a control measure of critical importance. Regular testing in combination which other approaches helps minimize uncertainty and coordinate other strategies. [@info:doi/10.2196/27254, p.2] This makes a potentially accurate predictor for test results an useful tool to minimize testing errors. 
+
+To accomplish accurate predictions, different Machine learning approaches are conducted and examined. Machine Learning can be applied in a fast variety of fields including medical applications [@ElNaqa2015] and is a suitable tool in solving a variety of prediction problems. In this report, the chosen model will be trained to predict the test results, given different measurements.\
+
+In the first part of this report, an exploratory data analysis is conducted to better understand the data set and explore the overall data quality, variable distributions and correlations, among other factors. This process is required to ensure a qualitative fundament for further processing steps. After the exploratory analysis, different attempts and comparisons towards building an accurate predictor for COVID-19 test results, given the in the data set contained informations, are performed and documented. The data set on which this report is based can be found on the official website of the Health Ministry of Israel. [@GovIsrael2021] The in the data set contained dimensions are shown in the [table](#d_overview) below. The measurements in the data set were collected in the time frame: 2020.03.11 - 2020.04.30 (year.day. month format).\
+The variables of interest are symptoms. These data will be used to predict if a person is likely to be classified as positive, negative or other. Other in this context stand for either not tested, in testing or inconclusive. [@GovIsrael2021]
+If symptoms alone are proven to be unsatisfactory, other measurements will be taken into account too. These questions will be examined in depth in the exploratory analysis. The final goal of the report is to construct a reasonably accurate predictor of COVID-19 test results, given the underlying data. Therefore, different machine learning models are tested in an automated approach and promising models are further examined. In the final chapter [CONCLUSIONS](#c_conclusions) a recommendation for one of the tried models will be formulated and further steps explained.\
+   
+
+# DATA PROCESSING
+
+### Data overview table{#d_overview}
+
+```{r load_data_and_inspect_0, echo=FALSE}
+
+#Overview reduced for visualization based one raw csv data 
+
+skimr::skim(data_Covid19) %>%  as_tibble() %>% mutate(unique_val = character.n_unique) %>% 
+  select(skim_variable, n_missing, character.min, character.max,unique_val) %>% 
+  kbl() %>% kable_material(c("striped"))   # style element for tables
+
+```
+
+The [data overview table](#d_overview) above shows the in the data set contained variables and the number of possible values (distinct values) unprocessed. 
+The variables are categorical, which means each of them has a fixed number of possible values. Most of the variables consist of two values, 0 or 1 and None.
+
+The [data overview table](#d_overview) shows that the most variables have three distinct values. 
+The goal of the in the report used models is to accurately predict the 'corona result' variable given a subset of the other variables in the data set. The data variables not used in this report are: 'the date of the test' and demographic information (e.g., gender). These measurements will not be examined further to obtain a high level of generalization of the later constructed models. Future data sets are obviously having different date periods, seasons and should still be able to be reasonably well predicted. An approach beyond the scope of this report would be to incorporate seasonality and other date factors from previous recorded data sets.
+
+
+
+```{r load_data_and_inspect_1, include=FALSE}
+
+# inspection of raw csv data
+
+table(data_Covid19$corona_result)
+
+summary(data_Covid19) #len 278.848
+
+
+
+# data transformation into meaningful types (None values in symptoms still included)
+
+data_Covid19_ord <- data_Covid19 %>% mutate(test_date = as.Date(test_date)) %>% 
+  mutate(across(2:6,as.factor)) %>%                              #cant parse to numeric due to None values. 
+  mutate(across(c(corona_result,test_indication),as.factor))%>%  #conversion to factor
+  select(-age_60_and_above, -gender, -test_date)                 #exclude demographic data
+
+```
+
+### Data quality overview table {#d_quality_overview}
+
+```{r load_data_and_inspect_3, echo=FALSE, warning=FALSE}
+
+
+
+# inspecting cleaned tibble (still contains Nones)
+
+probTab <- xray::anomalies(data_Covid19_ord)$problem_variables 
+
+probTab[c("Variable","pZero", "qDistinct")] %>% kbl() %>% kable_material(c("striped"))  
+
+
+```
+### Test result distribution table {#d_response_overview}
+
+```{r response_V, echo=FALSE, warning=FALSE}
+
+prop.table(table(data_Covid19_ord$corona_result)) %>% kbl() %>% kable_material(c("striped"))  
+
+```
+
+An inspection of the data [data quality overview table](#d_quality_overview) shows that five variables contain a high percentage of zero values. These variables are symptom measurements which raise the following questions: how many people are positive while being symptom free (labeled with a zero value for the specific symptom), and how many people are positive with symptoms?
+To investigate these variables is critical important due to their further role as possible predictors in the final machine learning implementation. Another issue is a low percentage of None data in the symptoms (1-255 occurrences). None in the symptoms stands for not known (symptoms are self reported). [@GovIsrael2021] 
+Rows containing a None entry in one of the symptom variables could be removed, which would reduce the data by < 0,001% but due to a possible importance (Missing not at random) they will be kept for further processing steps.
+
+The COVID-19 test results data contains (already mentioned in the introduction) three categories: positive, negative or other (other can stand for not tested, in testing or inconclusive). [@GovIsrael2021] The data labeled as other will be removed after the exploratory analysis, due to the fact that this report aims to construct a classifier with the results: positive or negative. 'Other' accounts for 0.0139574% of the entries in the data set. 
+
+```{r none_values_test, include=FALSE, echo=FALSE}
+
+#inspect None Values further 
+
+data_Covid19_ord %>% select(1:6) %>% pivot_longer(1:5) %>%  filter(value == "None") %>%
+  group_by(name, corona_result) %>%  
+  dplyr::summarise(Count = length(value)) %>% 
+
+ggplot(aes(fill= corona_result)) + 
+  geom_col(aes(x=Count, y=name)) + 
+  ylab("Symptom name") +
+  scale_x_continuous(labels = scales::comma) + xlab("tests with symptoms") +
+  scale_fill_brewer(palette = "Blues") + ggtitle("Symptoms labeled None") 
+
+```
+
+# EXPLORATORY ANALYSIS
+
+## Analysis of symptom variables
+
+```{r exploratory_chunk_1, include=TRUE, echo=FALSE}
+
+#create comparison table non-zero values symptoms for negative and positive test results
+
+sn_set <- data_Covid19_ord %>% filter(corona_result == "positive") %>% 
+  select(-test_indication, -corona_result) %>% 
+  pivot_longer(everything()) %>% 
+  mutate(amountNonZeroV = ifelse(value==1,1,0)) %>%  # necessary step due to the fact that None still contained in symptoms 
+  select(-value) %>%
+  group_by(name) %>% 
+  dplyr::summarise(sumNonZeroV = sum(amountNonZeroV)) 
+
+sn_set_neg <- data_Covid19_ord %>% filter(corona_result == "negative") %>% 
+  select(shortness_of_breath,sore_throat,head_ache,fever,cough) %>% 
+  pivot_longer(everything()) %>% 
+  mutate(amountNonZeroV = ifelse(value==1,1,0)) %>%    
+  select(-value) %>%
+  group_by(name) %>% 
+  dplyr::summarise(sumNonZeroV = sum(amountNonZeroV)) 
+
+
+#helper variables total cases - Totals
+
+dat <- data_Covid19_ord %>% 
+  filter(corona_result == "positive") 
+
+dat_other <- data_Covid19_ord %>%   #to subtract other from negative 
+  filter(corona_result == "other") 
+
+numbTotCases_Positive <- length(dat$corona_result) 
+
+numbTotCases_Negative <- length(data_Covid19_ord$corona_result) - length(dat$corona_result) - length(dat_other$corona_result)
+
+
+#Symptomatic to positive cases
+p1 <- ggplot(sn_set, mapping=aes(y=numbTotCases_Positive, x= name)) +  #we use total cases due to the overlap of symptomatic cases 
+  geom_col(aes(fill = "no symptoms")) +
+  geom_col(aes(fill = "symptoms", y=sumNonZeroV)) +
+  ylab("positive tests") +
+  xlab("Symptom names") + 
+  scale_y_continuous(labels = scales::comma) +
+  scale_fill_brewer(palette="YlGn") + ggtitle("Symptome distribution in positive tests")  + coord_flip()
+
+#Symptomatic to negative cases
+p2 <- ggplot(sn_set_neg, mapping=aes(y=numbTotCases_Negative, x= name)) +  
+  geom_col(aes(fill = "no symptoms")) +
+  geom_col(aes(fill = "symptoms", y=sumNonZeroV)) +
+  ylab("negative tests") +
+  xlab("Symptom names") + 
+  scale_y_continuous(labels = scales::comma) +
+  scale_fill_brewer(palette="Blues") + ggtitle("Symptome distribution in negative tests") + coord_flip()
+
+# combined Plot
+
+p1 + p2  +  plot_layout(nrow = 2, ncol =2, byrow = FALSE) + 
+  plot_annotation(title = 'Symptomatic ~ Test results', 
+                  subtitle = "Comparison of share of symptoms by positive and negative test results")
+
+```
+The plots show negative tests are often accompanied by fewer symptoms than positive test results. This was expected and indicates that symptoms might be a suitable predictor.
+
+```{r exploratory_chunk_2, include=TRUE, echo=FALSE}
+
+# Test results of symptomatic persons 
+
+sn_set_2 <- data_Covid19_ord %>% select(-test_indication) %>% 
+  pivot_longer(-corona_result) %>% 
+  mutate(amountNonZeroV = ifelse(value==1,1,0)) %>% 
+  select(-value) %>% 
+  group_by(corona_result, name) %>% 
+  dplyr::summarise(sumNonZeroV = sum(amountNonZeroV),.groups = 'drop')
+
+
+ggplot(sn_set_2, aes(fill= corona_result)) + 
+  geom_col(aes(x=sumNonZeroV, y=name)) + 
+  ylab("Symptom name") +
+  scale_x_continuous(labels = scales::comma) + xlab("tests with sympthoms") +
+  scale_fill_brewer(palette = "Blues") + ggtitle('Symptomatic test results')
+
+```
+Graph "Symptomatic test results" also shows that some symptoms are stronger predictors than others (e.g., sore throat, shortness of breath and headache are powerful predictors). Problematic is the high amount of symptom free positive tests. A purely Symptom based testing approach has proven to be insufficient in past strategic applications to contain COVID-19. [@info:doi/10.2196/27254, p.1] Therefore, also in this report other data measurements next to symptoms have to be considered to find a more meaningful predictor.
+
+## Analysis of test indication 
+
+Another potentially useful measurement in the data set is the Test Indication. Test Indication is a measurement which provides information if the tested person entered from abroad or had contact with a confirmed infected of COVID-19 or none of the above (Labeled Other).
+
+
+```{r exploratory_chunk_3, include=TRUE, echo=FALSE}
+
+#Simple plot of test result proportion in the three different states. 
+
+data_Covid19_ord %>% ggplot(aes(x=test_indication,fill=corona_result)) + geom_bar(position = "fill") +
+  labs(y = "Proportion", x="Test Indication") + 
+  scale_fill_brewer(palette = "Blues") + ggtitle("Proportion of test results given one of the three test indicators")
+
+```
+
+The total number of occurrences of the different test indicators in the source data is shown in the table below. This shows that the indicators: Abroad and Contact with confirmed are roughly 13% (12,95). This is a relatively sparse occurrence in the data set. From the three different categories, 'Contact with confirmed' seems to be the strongest indicator for a positive COVID-19 test classification.
+
+### Test indication table
+
+```{r data_distri, include=TRUE, echo=FALSE}
+
+
+tab_1 <- table(data_Covid19_ord$test_indication)
+
+sum_100Percent <- tab_1[[1]] + tab_1[[2]] + tab_1[[3]]
+
+# Get proportion of Indication Tests 
+
+Abroad<-paste("Tests labeled with information: Abroad (in percantage)", round((tab_1[[1]] / sum_100Percent) * 100, digits = 2), "%")
+Contact_with_confirmed<-paste("Tests labeled with information: Contact with confirmed (in percantage)", 
+                              round((tab_1[[2]] / sum_100Percent) * 100, digits = 2), "%")
+Other<-paste("Tests labeled with information: Other (in percantage)", round((tab_1[[3]] / sum_100Percent) * 100, digits = 2), "%")
+
+tib_perce <- tibble(Test_Indications = c(Abroad,Contact_with_confirmed,Other))
+
+tib_perce %>% kbl() %>% kable_material(c("striped"))  # Frequency table
+
+```
+## Analysis of correlation
+
+The for the modeling process chosen data measurements (symptoms and test indication) will be inspected regarding possible correlations between measurements. The previous plots already show signs for correlation between test results and different symptoms and test indications. 
+A common method in estimating associations between categorical variables is the Pearson chi-squared test, but interpreting the chi-squared statistic is comparably unintuitive. Cramers statistic, as an alternative, returns a range between 0 and 1 (Where 1 is being a strong association and 0 being a weak association). [@inbook, p.1] To get a deeper understanding of the relationships in the data set a [Correlation table](#d_corr) was calculated in which Cramer's V values greater or equal to 1.8 are displayed (Cramer's V values smaller 1.8 can be considered relatively weak associated, given the degrees of freedom). 
+The correlation plot below is based on 'hot dummy encoding', which creates for factor elements a column with a binary value (0 or 1). This plot is used to link and deepen the findings of the [Correlation table](#d_corr) below. The correlations shown through the plot and table will be considered in the feature engineering process.  
+
+### Correlation table {#d_corr}
+
+```{r correlation_tests, include=TRUE, echo=FALSE, warning=FALSE}
+
+#CramersV 1 = large association between vars, 0 = no association
+
+set.seed(123)    #df = 2 CV ~ 0.21 (Medium) - source in Text 
+
+dat <- data_Covid19_ord
+
+col_N <- colnames(data_Covid19_ord)
+
+array_Safe <- array(NA,c(42,3))
+
+colnames(array_Safe) <- c("Name_1","Name_2","Cramer_V")
+
+count = 1     # cross check correlations
+
+for (y in col_N) {
+
+    for (x in col_N) {
+      
+      if (y != x){
+        
+        tab <- table(dat[[y]],dat[[x]])
+        
+        array_Safe[count,1] <- y
+        array_Safe[count,2] <- x
+        array_Safe[count,3] <- cramer_v(tab)
+        
+        
+      count = count +1
+      }
+      
+    }
+}
+
+# remove duplicants A - B  -- B - A
+
+array_Safe <- array_Safe[!duplicated(apply(array_Safe,1,function(x) paste(sort(x),collapse=''))),] %>% as_tibble() %>%  mutate(Cramer_V = as.numeric(Cramer_V)) %>%  filter(Cramer_V >= 0.18) %>% 
+  arrange(desc(Cramer_V)) 
+
+array_Safe %>% kbl() %>% kable_material(c("striped")) #style element
+
+
+corrTibb <- dat %>%  mutate(tI = test_indication, short_breath = shortness_of_breath ) %>%  select(-test_indication, -shortness_of_breath)
+
+#caret -one-hot dummy for better interpret ability 
+
+dummies <- dummyVars(~0+.,data = corrTibb)
+dummiedDF <- predict(dummies, newdata = corrTibb)
+
+
+#model.matrix(~0+., data=corrTibb) / dummy (not - one hot)
+
+
+ dummiedDF %>%  cor(use="pairwise.complete.obs") %>% 
+  ggcorrplot(show.diag = F, type="lower", lab_size=2.5, outline.col = "lightblue",
+             colors = c(pal_simple_blues[7],"white", pal_simple_greens[7]), 
+             title = "Correlation (one hot encoded)", ggtheme = "theme_minimal") 
+
+
+```
+
+# PREDICTIVE MODEL
+
+## Preperation   
+
+```{r Preperation_and_sampling, include=FALSE, echo=FALSE, warning=FALSE}
+
+
+#small cleans (factor)
+
+data_FB_covid <- data_Covid19_ord %>% filter(data_Covid19_ord$corona_result!="other") %>% mutate(corona_result = factor(corona_result, levels=c("negative","positive")))
+
+#data split - training, test
+
+split_s <- rsample::initial_split(data_FB_covid, prop = 3/4, strata = "corona_result")
+
+data_FB_covid_train <- training(split_s)
+data_FB_covid_test <- testing(split_s)
+
+#Check result - stratified 
+
+prop.table(table(data_FB_covid_train$corona_result))
+prop.table(table(data_FB_covid_test$corona_result))
+
+```
+
+## Performance metrics
+
+In prediction, simplicity and accuracy are not always mutually inclusive. More interpret able models often under perform less interpret able models [@10.1214/ss/1009213726, p.206]. In this report, the focal goal of the predictive model will be firstly its performance opposed to its complexity. As an objective metric for choosing the models, predictive performance k-fold cross-validation will be used and a table of metrics compared. Due to the fact that a false negative test prediction is highly problematic, in the context of a contagious disease, minimizing this metric will be one of the main targets of optimization. The second focal metric is balanced accuracy, which consists of sensitivity and specificity and gives a good indication for detection of negative as well as positive cases. 
+
+## Feature Engineering 
+
+From [Correlation table](#d_corr) it is clear that the variables: test indication (0.4026793), headache (0.2580578) have the highest dependency on the response variable corona result, followed by Sore Throat (0.1951836) and fever(0.1869946). The models will be tested on these variables to safe computation speed. All features are One-hot encoded. The data set is unbalanced, which means that the corona test results are very unequally distributed (see [Table](#d_response_overview) for details). To achieve tolerable results, undersampling will be tested on the data set. This means the distribution will be better equalized (1:1) in terms of corona test predictions by using only a subset of the negative tests. Under sampling has proven to be a simple and effective approach to work with imbalance in a data set. [@6137280, p.757]
+
+
+```{r Feature_engineering_1_preperation, include=FALSE, echo=FALSE, warning=FALSE}
+
+set.seed(123)
+
+#No imputations and no normalization necessary - PCA problematic because of the purely categorical fundamental 
+
+#recipe  - creation of recipe with one hot and down-sampling (for balance)
+
+recipe_pre_process_1 <- recipe(corona_result ~ ., data_FB_covid_train) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%  themis::step_downsample(corona_result,under_ratio = 1)  
+
+recipe_pre_2 <- recipe(corona_result ~ ., data_FB_covid_train) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)  #for test data
+
+#to show that it worked and use as baked training  
+
+pre <- prep(recipe_pre_process_1, retain = TRUE, verbose = TRUE)
+
+training_balanced <- bake(pre, new_data = NULL)   #Baked training - balanced 
+
+prop.table(table(training_balanced$corona_result)) #balanced 
+
+#prep for test 
+
+pre_test <- prep(recipe_pre_2) #same except balancing 
+
+
+
+#Preparation code for C5.0 and others
+
+#Important to store results of C5.0 trials 
+
+modelArray <- array(NA,c(4,7))
+colnames(modelArray) <- c("model_name","FP","FN","Sensitivity","Specificity","Balanced Accuracy","Remark")
+
+#Testing set-up 
+
+testB <- bake(pre_test, data_FB_covid_test) #apply recipe to test (not balanced because test)
+
+prop.table(table(testB$corona_result))  #un-balanced how its supposed to be 
+
+
+```
+
+## Model evaluation 
+
+To find a suitable classifier, different models will be compared (cross validation applied). The tree models are: 'Bagged Classification Trees', 'C5.0', 'Simple Neural Nets' and 'Random Forest'. These models were chosen due to their widespread usage and robustness in classification. Other models were excluded for several reasons, e.g., not one hot encoding compatible (methods which rely on distance measurements).
+
+```{r model_prep_unbalanced, include=FALSE, echo=FALSE, warning=FALSE}
+
+#unbalanced therefore again recipe step / other models based on balanced data - the following data is used for the ensemble and reference models 
+
+set.seed(123)
+
+#recipe  - creation of recipe with one hot and down-sampling (for balance)
+
+recipe_pre_process_unbalanced <- recipe(corona_result ~ ., data_FB_covid_train) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+
+# to show that it worked and use as baked training  
+
+pre_unbalanced <- prep(recipe_pre_process_unbalanced, retain = TRUE, verbose = TRUE)
+
+training_unbalanced <- bake(pre_unbalanced, new_data = NULL)   #Baked training - balanced 
+
+prop.table(table(training_unbalanced$corona_result)) #unbalanced 
+
+```
+
+
+```{r model_broad_comparison, include=FALSE, echo=FALSE, warning=FALSE}
+
+set.seed(123)
+
+#strong reduced data set to make computation possible - results are only a rough orientation for model selection, therefore reduction a compromise. 
+
+split_reduce <- rsample::initial_split(training_unbalanced, prop = 1/5, strata = "corona_result")
+
+training_unbalanced_reduced <- training(split_reduce)
+
+
+#---------------------------------------------------------------------------------------------- Batch for rough orientation 
+t_control_paramaters <- trainControl(method = 'cv', # for repeated cross-validation
+                                   number = 3, # number of k-folds
+                                   classProbs = TRUE, 
+                                   verboseIter = TRUE,
+                                   savePredictions = 'final',
+                                   allowParallel = TRUE)
+
+batch_model_list <- caretList(corona_result ~., 
+                               training_unbalanced_reduced, 
+                               trControl = t_control_paramaters,
+                               methodList = c('C5.0', 'ranger', 'treebag', 'nnet'),
+                               tuneList = NULL,
+                               continue_on_fail = F)
+
+#---------------------------------------------------------------------------------------------- Batch on balanced 
+
+batch_model_list_balanced <- caretList(corona_result ~., 
+                               training_balanced, 
+                               trControl = t_control_paramaters,
+                               methodList = c('C5.0', 'ranger', 'treebag', 'nnet'),
+                               tuneList = NULL,
+                               continue_on_fail = F)
+
+```
+
+
+```{r model_broad_comparison_plot_prg, echo=FALSE, message=FALSE}
+
+#SLOW performance part - evalM
+
+mod_list <- list(batch_model_list$C5.0, batch_model_list$ranger, batch_model_list$treebag, batch_model_list$nnet)
+
+mod_list_2 <- list(batch_model_list_balanced$C5.0, batch_model_list_balanced$ranger, batch_model_list_balanced$treebag, batch_model_list_balanced$nnet)
+
+res <- evalm(mod_list, plots='prg',bins=8,
+             gnames = c("C5.0","ranger","treebag","nnet"),
+             cols = c(s_blue[1],"chartreuse4","greenyellow", "Blue"),
+             title = "Precision-Recall Curve - CV 3", silent = TRUE)
+
+res_2 <- evalm(mod_list_2, plots='prg',bins=8,
+             gnames = c("C5.0","ranger","treebag","nnet"),
+             cols = c(s_blue[1],"chartreuse4","greenyellow", "Blue"),
+             title = "Precision-Recall Curve on balanced - CV 3", silent = TRUE) 
+```
+The prg curve visualizes the precision gain against the Sensitivity gain. The higher the area under the curve, the better. In the four models 'Bagged Classification Trees' (treebag) performs the best, while 'C5.0' and 'ranger' (random forests) perform both equivalent poorly. This test was performed on a stratified subset of the data set (unbalanced) for computational reasons. The superior performance of 'Bagged Classification Trees' is explainable through its ability to work with class imbalances. 
+
+In the second graph, which uses undersampled data as a source, it is visible that neural nets seem not to be a fitting model if higher Recall (low false negative rate) is needed. Due to comparable performance, 'C5.0' will be evaluated over random forest in the further process. 'C5.0' and 'Bagged Classification Trees will be optimized and compared on a balanced data fundament to determine which optimized model is more suitable as a predictor for corona test results.  
+ 
+## C5.0 evaluation 
+
+```{r model_1, include=FALSE, echo=FALSE, warning=FALSE}
+
+#Standard C5.0 unbalanced
+
+set.seed(123)
+
+
+
+test_res_control_paramaters <- trainControl(method = 'cv',
+                                   number = 5, 
+                                   classProbs = TRUE,
+                                   verboseIter = TRUE,
+                                   savePredictions = "final",
+                                   allowParallel = TRUE)
+
+
+
+#model <- caret::train(ta, ta$corona_result,  method = "C5.0")
+
+C5_model_trained_un <- caret::train(corona_result ~ .,
+                     data = training_unbalanced,
+                     method ="C5.0",
+                     metric = "Accuracy",
+                     trControl  = test_res_control_paramaters,
+                     tuneGrid =data.frame(trials=10, model="tree", winnow=FALSE))   
+
+
+
+
+# predict 
+
+predict_ub <- caret::predict.train(C5_model_trained_un, testB)
+
+cfM <- confusionMatrix(predict_ub, as.factor(testB$corona_result))
+
+
+#fill data for comparison 
+
+modelArray[1,1] <- C5_model_trained_un$method 
+modelArray[1,2] <- cfM$table[2]
+modelArray[1,3] <- cfM$table[3]
+modelArray[1,4] <- cfM$byClass[1]
+modelArray[1,5] <- cfM$byClass[2]
+modelArray[1,6] <- cfM$byClass[11]
+modelArray[1,7] <- "simple C5.0"
+              
+  
+```
+
+
+```{r model_2, include=FALSE, echo=FALSE, warning=FALSE}
+
+#Standard C5.0
+
+set.seed(123)
+
+
+#model <- caret::train(ta, ta$corona_result,  method = "C5.0")
+
+C5_model_trained <- caret::train(corona_result ~ .,
+                     data = training_balanced,
+                     method ="C5.0",
+                     metric = "Accuracy",
+                     trControl  = test_res_control_paramaters,
+                     tuneGrid =data.frame(trials=10, model="tree", winnow=FALSE))   
+
+
+# predict 
+
+predict <- caret::predict.train(C5_model_trained, testB)
+
+cfM_2 <- confusionMatrix(predict, as.factor(testB$corona_result))
+
+
+#fill data for comparison 
+
+modelArray[2,1] <- C5_model_trained$method 
+modelArray[2,2] <- cfM_2$table[2]
+modelArray[2,3] <- cfM_2$table[3]
+modelArray[2,4] <- cfM_2$byClass[1]
+modelArray[2,5] <- cfM_2$byClass[2]
+modelArray[2,6] <- cfM_2$byClass[11]
+modelArray[2,7] <- "balanced data"   #balanced
+              
+  
+```
+
+
+
+```{r model_3, include=FALSE, echo=FALSE, warning=FALSE}
+
+#punishment for false negatives > severely - Factor 5 (see cost)
+
+set.seed(123)
+
+
+
+#model <- caret::train(ta, ta$corona_result,  method = "C5.0")
+
+error_cost <- matrix(c(0, 5, 1, 0), nrow = 2)
+
+
+C5_model_trained_coun <- caret::train(corona_result ~ .,
+                     data = training_balanced,
+                     method ="C5.0Cost",
+                     metric = "Accuracy",
+                     trControl  = test_res_control_paramaters,
+                     tuneGrid =data.frame(trials=10, model="tree", winnow=FALSE, cost = 3))
+
+
+
+
+
+# predict 
+
+predict <- caret::predict.train(C5_model_trained_coun, testB, pred=TRUE)
+
+cfM_3 <- confusionMatrix(predict, as.factor(testB$corona_result))
+
+
+modelArray[3,1] <- C5_model_trained_coun$method 
+modelArray[3,2] <- cfM_3$table[2]
+modelArray[3,3] <- cfM_3$table[3]
+modelArray[3,4] <- cfM_3$byClass[1]
+modelArray[3,5] <- cfM_3$byClass[2]
+modelArray[3,6] <- cfM_3$byClass[11]
+modelArray[3,7] <- "weights x3 / bd"  #balanced + weights 
+
+
+
+```
+
+```{r model_4, include=FALSE, echo=FALSE, warning=FALSE}
+
+#uses model 2 (no cost and balanced data set)
+
+predict_prob <- caret::predict.train(C5_model_trained, testB, type = "prob")
+
+pred_fac_prob <- predict_prob %>% as_tibble() %>% mutate(corona_result = ifelse(negative >= 0.81, "negative", "positive")) %>%
+  select(-negative, - positive ) %>% mutate(corona_result = as.factor(corona_result)) 
+
+
+cfM_threshold <- caret::confusionMatrix(pred_fac_prob$corona_result, reference = testB$corona_result)
+
+
+modelArray[4,1] <- C5_model_trained$method 
+modelArray[4,2] <- cfM_threshold$table[2]
+modelArray[4,3] <- cfM_threshold$table[3]
+modelArray[4,4] <- cfM_threshold$byClass[1]
+modelArray[4,5] <- cfM_threshold$byClass[2]
+modelArray[4,6] <- cfM_threshold$byClass[11]
+modelArray[4,7] <- "threshold / bd"  #balanced + weights 
+
+
+```
+
+
+### C5.0 comparison table {#d_comp_c5}
+
+```{r model_123_table, include=TRUE, echo=FALSE, warning=FALSE}
+
+modelArray %>% as_tibble() %>% dplyr::mutate(across(2:6, as.numeric)) %>% dplyr::mutate(across(where(is_numeric),round, digits= 3)) %>% dplyr::mutate(across(where(is_numeric), as.character)) %>%  
+ data.table::transpose(keep.names	= "Description") %>% dplyr::rename(model_1 = V1,model_2 = V2,model_3 = V3,model_4 = V4) %>%   kbl() %>% kable_material(c("striped"))  # Frequency table
+
+```
+The [C5.0 comparison table](#d_comp_c5) shows different versions of the C5.0 model. Model 1 performs very well in recognizing negative test results and therefore optimizing the accuracy, but due to the sparse occurrences of positive tests in the data set, a strong majority of these tests will be just predicted as negative. This is in the context of the data not acceptable. Model 3, which is applied to a balanced version of the data set and uses additional error costs (weights FN mistakes with factor 3), performs the best in terms of its Balanced Accuracy. The trade of for gaining fewer FN predictions is an increase in FP predictions (see red fields in the graph below). Model 4, which relies on a very high threshold to categorize results as negative, performs slightly better in terms of FN but has a lower value in Balanced Accuracy. 
+
+```{r model_3_final_plot_confusionMatrix, include=TRUE, echo=FALSE, warning=FALSE}
+
+#Table to visualize confusion matrix 
+
+cfM_threshold$table %>%  as_tibble() %>% 
+ggplot(mapping = aes(x = Prediction,
+                     y = Reference)) +
+  geom_tile(aes(fill=ifelse((Prediction == "negative" & Reference == "positive" | Prediction == "positive" & Reference == "negative"), NA, n)
+                ),show.legend	 = FALSE) +    
+  scale_fill_distiller(na.value	= "lightcoral", palette=c("Blues")) +
+  geom_text(aes(label = paste(round(n/sum(n)*100, digits = 2), "%")), colour = "Black") +
+  labs(title = "C5.0 results", subtitle = "undersampled data fundament and negative probability threshold 0.83") 
+
+
+```
+
+## Bagged Classification Trees evaluation 
+
+
+```{r model_bagged_1, include=FALSE, echo=FALSE, warning=FALSE}
+
+set.seed(123)
+
+# Set up table values for comparison
+
+modelArray_bagged <- array(NA,c(2,7))
+
+colnames(modelArray_bagged) <- c("model_name","FP","FN","Sensitivity","Specificity","Balanced Accuracy","Remark")
+
+#model 1
+
+
+
+
+bagged_CART_model_trained_un <- caret::train(corona_result ~ .,
+                     data = training_unbalanced,
+                     method ="treebag",
+                     metric = "Accuracy",
+                     trControl  = test_res_control_paramaters)   
+
+
+pred <- predict(object = bagged_CART_model_trained_un, newdata = testB, type = "prob") 
+
+
+
+pred_fac <- pred %>% as_tibble() %>% mutate(corona_result = ifelse(negative >= 0.5, "negative", "positive")) %>%
+  select(-negative, - positive ) %>% mutate(corona_result = as.factor(corona_result)) 
+
+
+                                
+cfM_bagged_1 <- caret::confusionMatrix(pred_fac$corona_result, reference = testB$corona_result)
+
+
+
+modelArray_bagged[1,1] <- bagged_CART_model_trained_un$method 
+modelArray_bagged[1,2] <- cfM_bagged_1$table[2]
+modelArray_bagged[1,3] <- cfM_bagged_1$table[3]
+modelArray_bagged[1,4] <- cfM_bagged_1$byClass[1]
+modelArray_bagged[1,5] <- cfM_bagged_1$byClass[2]
+modelArray_bagged[1,6] <- cfM_bagged_1$byClass[11]
+modelArray_bagged[1,7] <- "standard" 
+
+```
+
+```{r model_bagged_2, include=FALSE, echo=FALSE, warning=FALSE}
+
+#only difference performed on balanced data set
+
+set.seed(123)
+
+
+
+
+
+bagged_CART_model_trained <- caret::train(corona_result ~ .,
+                     data = training_balanced,
+                     method ="treebag",
+                     metric = "Accuracy",
+                     trControl  = test_res_control_paramaters)   
+
+
+pred <- predict(object = bagged_CART_model_trained, newdata = testB, type = "prob") 
+
+
+
+pred_fac <- pred %>% as_tibble() %>% mutate(corona_result = ifelse(negative >= 0.5, "negative", "positive")) %>%
+  select(-negative, - positive ) %>% mutate(corona_result = as.factor(corona_result))
+
+                                
+cfM_bagged_2 <- caret::confusionMatrix(pred_fac$corona_result, reference = testB$corona_result)
+
+
+
+modelArray_bagged[2,1] <- bagged_CART_model_trained$method 
+modelArray_bagged[2,2] <- cfM_bagged_2$table[2]
+modelArray_bagged[2,3] <- cfM_bagged_2$table[3]
+modelArray_bagged[2,4] <- cfM_bagged_2$byClass[1]
+modelArray_bagged[2,5] <- cfM_bagged_2$byClass[2]
+modelArray_bagged[2,6] <- cfM_bagged_2$byClass[11]
+modelArray_bagged[2,7] <- "on balanced data set"  
+
+```
+
+
+### Bagged Classification Trees comparison table {#d_comp_bagged}
+
+```{r model_bagged_plot, include=TRUE, echo=FALSE, warning=FALSE}
+
+
+
+modelArray_bagged %>% as_tibble() %>% dplyr::mutate(across(2:6, as.numeric)) %>% dplyr::mutate(across(where(is_numeric),round, 3)) %>% dplyr::mutate(across(where(is_numeric),as.character)) %>%  
+ data.table::transpose(keep.names	= "Description") %>% dplyr::rename(model_1 = V1, model_2 = V2) %>%   kbl() %>% kable_material(c("striped"))  # Frequency table
+
+
+cfM_bagged_2$table %>%  as_tibble() %>% 
+ggplot(mapping = aes(x = Prediction,
+                     y = Reference)) +
+  geom_tile(aes(fill=ifelse((Prediction == "negative" & Reference == "positive" | Prediction == "positive" & Reference == "negative"), NA, n)
+                ),show.legend	 = FALSE) +    
+  scale_fill_distiller(na.value	= "lightcoral", palette=c("Blues")) +
+  geom_text(aes(label = paste(round(n/sum(n)*100, digits = 2), "%")), colour = "Black") +
+  labs(title = "Bagged Classification Trees results", subtitle = "on balanced data set") 
+
+
+
+
+```
+The two evaluated models (see [Bagged Classification Trees comparison table ](#d_comp_bagged)) differ only regarding their underlying data. Model 1 was fitted to the unbalanced data set while model 2 was fitted to the balanced data set. Model 2 of Bagged Classification Trees perform identically to model 3 in C5.0 (see [C5.0 comparison table](#d_comp_c5)) while model 1 performs rather poorly.
+
+
+# CONCLUSIONS {#c_conclusions}
+
+In the following key findings of the analysis will be short summarized: 
+
+- Due to correlation, the non-demographic variables were reduced to the strongest correlating variables (with depended variable) to increase computation speed.   
+
+- The predictive quality of the models could be increased through undersampling the data set.
+
+- The results of the models C5.0 and Bagged Classification Trees are very close and even overlap between some of the models. 
+
+- The best performing model in terms of reduction of False negatives (which was defined as critical) is model 4 of C5.0 (see [C5.0 comparison table](#d_comp_c5)).
+
+- The best models in terms of Balanced Accuracy are: model 3 of C5.0 (see [C5.0 comparison table](#d_comp_c5)) and model 2 ( see [Bagged Classification Trees comparison table](#d_comp_bagged))
+
+The best overall model is model 4 (see [C5.0 comparison table](#d_comp_c5)) due to its very low false negative score. Even though its Balanced Accuracy is slightly lower, this model is the most conservative one regarding estimating a test as negative. This is important due to the consequences of wrongly classified test results.  
+
+To increase the performance of the classifier further, more data sets with past data could be taken additionally into consideration to improve the model's predictive capabilities. Seasonality could be a possible strong influence.
+
+# BIBLIOGRAPHY
+
